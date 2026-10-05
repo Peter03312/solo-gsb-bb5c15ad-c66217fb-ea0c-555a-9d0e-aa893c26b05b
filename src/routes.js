@@ -1240,4 +1240,222 @@ router.post('/videos/:id(\\d+)/restore/confirm', (req, res, next) => {
   }
 });
 
+/* ---------------- 片段整体平移（预览 -> 确认一次性应用） ---------------- */
+
+// 解析片段 ID 列表：必须为非空数组，元素为正整数（数字或数字字符串），不得重复
+function readSegmentIds(body) {
+  const raw = body && body.segment_ids;
+  if (!Array.isArray(raw)) {
+    throw new ApiError(422, 'invalid_segment_ids', '请以数组形式提交片段 ID 列表 segment_ids');
+  }
+  if (raw.length === 0) {
+    throw new ApiError(422, 'empty_selection', '请至少选择一个片段（segment_ids 不能为空）');
+  }
+  const ids = [];
+  raw.forEach((v) => {
+    const n = typeof v === 'number' && Number.isInteger(v)
+      ? v
+      : typeof v === 'string' && /^\d+$/.test(v.trim())
+        ? Number(v)
+        : NaN;
+    if (!Number.isInteger(n) || n < 1) {
+      throw new ApiError(422, 'invalid_segment_ids',
+        `片段 ID 必须为正整数，读到 ${JSON.stringify(v)}`);
+    }
+    ids.push(n);
+  });
+  const dupes = ids.filter((id, i) => ids.indexOf(id) !== i);
+  if (dupes.length) {
+    throw new ApiError(422, 'duplicate_segment_ids',
+      `片段 ID 不得重复：${[...new Set(dupes)].join('、')}`);
+  }
+  return ids;
+}
+
+// 解析非零整数毫秒偏移（数字或数字字符串）；布尔等类型明确拒绝
+function readOffsetMs(body) {
+  const raw = body && body.offset_ms;
+  const n = typeof raw === 'number' && Number.isInteger(raw)
+    ? raw
+    : typeof raw === 'string' && /^[+-]?\d+$/.test(raw.trim())
+      ? Number(raw)
+      : NaN;
+  if (!Number.isInteger(n)) {
+    throw new ApiError(422, 'invalid_offset', '时间偏移 offset_ms 必须为整数毫秒（如 500 或 -1000）');
+  }
+  if (n === 0) {
+    throw new ApiError(422, 'invalid_offset', '时间偏移 offset_ms 不能为 0');
+  }
+  return n;
+}
+
+// 计算平移计划：所选片段等距移动（相对间距不变），逐段检查越过视频边界，
+// 以及与未选片段的时间重叠（所选片段之间不互检；端点相接允许）。
+// 返回 { moves, conflicts, blocked }；任何冲突都存在时 blocked=true。
+function planShift(rows, selectedIds, offsetMs, durationMs) {
+  const byId = new Map(rows.map((s) => [s.id, s]));
+  const missing = selectedIds.filter((id) => !byId.has(id));
+  if (missing.length) {
+    throw new ApiError(404, 'segments_not_found',
+      `以下片段不存在或不属于该视频：${missing.join('、')}`, { missing_segment_ids: missing });
+  }
+  const selected = new Set(selectedIds);
+  const unselected = rows.filter((s) => !selected.has(s.id));
+  const moves = [];
+  const conflicts = [];
+
+  const addConflict = (code, seg, message, extra = {}) => {
+    conflicts.push({ code, segment_id: seg.id, start_ms: seg.start_ms, end_ms: seg.end_ms,
+      new_start_ms: seg.start_ms + offsetMs, new_end_ms: seg.end_ms + offsetMs, message, ...extra });
+  };
+
+  for (const s of selectedIds.map((id) => byId.get(id))) {
+    const ns = s.start_ms + offsetMs;
+    const ne = s.end_ms + offsetMs;
+    if (ns < 0) {
+      addConflict('shift_before_start', s,
+        `片段 #${s.id} 平移后起点 ${ns}ms 越过视频起点（不能小于 0）`);
+    }
+    if (ne > durationMs) {
+      addConflict('shift_beyond_duration', s,
+        `片段 #${s.id} 平移后终点 ${ne}ms 越过视频时长 ${durationMs}ms`);
+    }
+    // 与未选片段的时间重叠：半开区间相交，端点相接（newStart == other.end）允许
+    for (const o of unselected) {
+      if (ns < o.end_ms && o.start_ms < ne) {
+        addConflict('shift_overlap', s,
+          `片段 #${s.id} 平移后（${ns}–${ne}ms）与未选片段 #${o.id}（${o.start_ms}–${o.end_ms}ms）时间重叠（端点相接允许）`,
+          { other_segment_id: o.id, other_start_ms: o.start_ms, other_end_ms: o.end_ms });
+      }
+    }
+    moves.push({
+      id: s.id,
+      start_ms: s.start_ms,
+      end_ms: s.end_ms,
+      new_start_ms: ns,
+      new_end_ms: ne,
+      text: s.text,
+      reviewed: s.reviewed === 1,
+      revision: s.revision,
+    });
+  }
+
+  return { moves, conflicts, blocked: conflicts.length > 0 };
+}
+
+// 预览（不写入）：逐段给出调整前后时间、与未选片段的冲突；冲突时仅阻止确认，预览照常返回
+router.post('/videos/:id(\\d+)/segments/shift/preview', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const segmentIds = readSegmentIds(req.body);
+    const offsetMs = readOffsetMs(req.body);
+    const rows = get()
+      .prepare('SELECT * FROM segments WHERE video_id = ? ORDER BY start_ms, id')
+      .all(video.id);
+    const plan = planShift(rows, segmentIds, offsetMs, video.duration_ms);
+
+    const token = makePreviewToken({
+      videoId: video.id,
+      mode: 'shift',
+      draftHash: draftFingerprint(rows),
+      extra: { ids: segmentIds, off: offsetMs },
+    });
+
+    res.json({
+      offset_ms: offsetMs,
+      duration_ms: video.duration_ms,
+      selected_count: segmentIds.length,
+      moves: plan.moves,
+      conflicts: plan.conflicts,
+      blocked: plan.blocked,
+      token,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 确认：必须使用与预览完全相同的选择与偏移 + 预览令牌；预览后草稿有任何增删改或审校变化一律拒绝
+router.post('/videos/:id(\\d+)/segments/shift/confirm', (req, res, next) => {
+  try {
+    const videoId = Number(req.params.id);
+    const video = loadVideo(videoId);
+    const segmentIds = readSegmentIds(req.body);
+    const offsetMs = readOffsetMs(req.body);
+
+    const token = readPreviewToken(req.body && req.body.token);
+    if (!token || token.v !== video.id || token.m !== 'shift') {
+      throw new ApiError(409, 'preview_required',
+        '缺少有效的平移预览令牌：请先调用平移预览接口，再以预览返回的 token 确认');
+    }
+
+    const currentRows = get()
+      .prepare('SELECT * FROM segments WHERE video_id = ? ORDER BY start_ms, id')
+      .all(videoId);
+    if (token.d !== draftFingerprint(currentRows)) {
+      throw new ApiError(409, 'draft_changed',
+        '预览之后草稿已被修改（片段增删改或审校变化）。为避免覆盖更改，请重新预览后再确认；本次未写入任何内容',
+        { current_segments: currentRows.map(mapSegment) });
+    }
+    const sameIds = Array.isArray(token.ids) && token.ids.length === segmentIds.length &&
+      token.ids.every((id, i) => id === segmentIds[i]);
+    if (!sameIds || token.off !== offsetMs) {
+      throw new ApiError(422, 'shift_params_changed',
+        '确认时的片段选择或偏移与预览不一致，请按预览时的选择与偏移确认，或重新预览；本次未写入任何内容');
+    }
+
+    // 事务内重新加载并完整复算平移计划（不信任预览结果），逐段递增修订号、撤销原文审校
+    const result = get().transaction(() => {
+      const lockedVideo = get().prepare('SELECT * FROM videos WHERE id = ?').get(videoId);
+      if (!lockedVideo) throw new ApiError(404, 'not_found', `视频 #${videoId} 不存在`);
+      const rows = get()
+        .prepare('SELECT * FROM segments WHERE video_id = ? ORDER BY start_ms, id')
+        .all(videoId);
+      const plan = planShift(rows, segmentIds, offsetMs, lockedVideo.duration_ms);
+      if (plan.blocked) {
+        throw new ApiError(422, 'shift_blocked',
+          `平移被阻止：存在 ${plan.conflicts.length} 处越界或冲突，未写入任何内容：\n${plan.conflicts[0].message}`,
+          { conflicts: plan.conflicts });
+      }
+      // 写入后整段时间线必须合法（与其它写路径保持同一防线）
+      const idSet = new Set(segmentIds);
+      const timeline = rows.map((row) => idSet.has(row.id)
+        ? { id: row.id, start_ms: row.start_ms + offsetMs, end_ms: row.end_ms + offsetMs }
+        : { id: row.id, start_ms: row.start_ms, end_ms: row.end_ms });
+      const check = validateTimeline(timeline, lockedVideo.duration_ms);
+      if (!check.ok) {
+        throw new ApiError(422, 'invalid_timeline', `平移后时间线不合法，未写入任何内容：${check.reason}`);
+      }
+
+      const update = get().prepare(
+        `UPDATE segments SET start_ms = ?, end_ms = ?, reviewed = 0, revision = revision + 1, updated_at = ?
+         WHERE id = ? AND video_id = ?`
+      );
+      const ts = now();
+      for (const m of plan.moves) {
+        update.run(m.new_start_ms, m.new_end_ms, ts, m.id, videoId);
+      }
+      // 译文行不动：译文文字保留，其 source_* 与移动后原文不一致 -> 自动标记失效，
+      // 发布门禁与译文 SRT 导出据此阻止直接发布/导出，需按新时间重新校对
+      return plan;
+    })();
+
+    res.status(201).json({
+      ok: true,
+      offset_ms: offsetMs,
+      moved_count: result.moves.length,
+      moved: result.moves.map((m) => ({
+        id: m.id,
+        start_ms: m.new_start_ms,
+        end_ms: m.new_end_ms,
+        previous_start_ms: m.start_ms,
+        previous_end_ms: m.end_ms,
+      })),
+      segments: listSegments(videoId),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

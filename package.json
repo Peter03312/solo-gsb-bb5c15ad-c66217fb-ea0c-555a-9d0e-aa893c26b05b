@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node test/api.test.js"
+    "test": "TEST_PORT=${TEST_PORT:-$((RANDOM%20000+10000))} node test/api.test.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",

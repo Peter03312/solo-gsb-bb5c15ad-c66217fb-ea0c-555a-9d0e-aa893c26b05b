@@ -10,6 +10,7 @@ const state = {
   translationLang: null, // 译文轨道语言（未启用为 null）
   translations: [],      // 当前草稿全部译文（逐段关联）
   activeSegmentId: null,
+  selectedIds: new Set(), // 整体平移勾选的片段 ID
   editor: null, // { mode:'create'|'edit', segmentId, revision, initialText, dirty }
   pollTimer: null,
 };
@@ -198,6 +199,7 @@ async function openVideo(id) {
   state.translationLang = data.translation_lang != null ? data.translation_lang : null;
   state.translations = data.translations || [];
   state.activeSegmentId = null;
+  state.selectedIds = new Set();
   render();
   startPolling();
 }
@@ -217,6 +219,7 @@ function anyModalOpen() {
          !$('conflictModal').classList.contains('hidden') ||
          !$('importModal').classList.contains('hidden') ||
          !$('restoreModal').classList.contains('hidden') ||
+         !$('shiftModal').classList.contains('hidden') ||
          !$('trModal').classList.contains('hidden');
 }
 async function pollRefresh() {
@@ -274,6 +277,7 @@ function renderDetail() {
           <div style="display:flex;justify-content:space-between;align-items:center">
             <h2 style="margin:0">片段列表</h2>
             <div class="row-actions">
+              <button class="btn small" id="shiftSelBtn">⇄ 整体平移…</button>
               <button class="btn small" id="restoreRangeBtn">↩ 区间恢复…</button>
               <button class="btn small" id="importSrtBtn">⬆ 导入 SRT…</button>
               <button class="btn primary small" id="addBtn">＋ 新增片段</button>
@@ -282,7 +286,7 @@ function renderDetail() {
           <p class="meta">所有写操作都会携带你当前看到的修订号；修订号过期时服务端拒绝并返回冲突，绝不覆盖他人修改。${state.translationLang ? '原文文字或时间被修改后，对应译文会标记为「已失效」，需重新校对。' : ''}</p>
           <div class="side-scroll">
             <table class="seg-table">
-              <thead><tr><th>#</th><th>时间</th><th>文本</th>${state.translationLang ? '<th>译文</th>' : ''}<th>状态</th><th>操作</th></tr></thead>
+              <thead><tr><th class="seg-check-col"><input type="checkbox" id="segSelectAll" title="全选/取消全选" /></th><th>#</th><th>时间</th><th>文本</th>${state.translationLang ? '<th>译文</th>' : ''}<th>状态</th><th>操作</th></tr></thead>
               <tbody id="segTbody"></tbody>
             </table>
           </div>
@@ -298,6 +302,7 @@ function renderDetail() {
   $('addBtn').addEventListener('click', () => openEditor('create'));
   $('importSrtBtn').addEventListener('click', openImportModal);
   $('restoreRangeBtn').addEventListener('click', openRestoreModal);
+  $('shiftSelBtn').addEventListener('click', openShiftModal);
   const videoEl = $('videoPlayer');
   videoEl.addEventListener('timeupdate', onTimeUpdate);
 
@@ -388,12 +393,13 @@ function renderSegmentTable() {
   const tbody = $('segTbody');
   if (!tbody) return;
   const track = !!state.translationLang;
-  const colCount = track ? 6 : 5;
+  const colCount = track ? 7 : 6;
   if (!state.segments.length) {
     tbody.innerHTML = `<tr><td colspan="${colCount}" class="meta">还没有片段，点击右上角「新增片段」。</td></tr>`;
     return;
   }
   tbody.innerHTML = state.segments.map((s) => {
+    const checked = state.selectedIds.has(s.id);
     const tr = track ? trOf(s.id) : null;
     const trCell = track ? `
       <td class="seg-text-cell">${tr ? (esc(tr.text) || '<span class="meta">(空)</span>') : '<span class="meta">—</span>'}
@@ -402,7 +408,8 @@ function renderSegmentTable() {
         <button class="btn small" data-act="tr-edit">${tr ? '改译文' : '录译文'}</button>
         ${tr && !tr.stale ? `<button class="btn small ${tr.reviewed ? 'ghost' : 'ok'}" data-act="tr-review">${tr.reviewed ? '取消审译' : '审译'}</button>` : ''}` : '';
     return `
-    <tr data-id="${s.id}" class="${state.activeSegmentId === s.id ? 'active' : ''}">
+    <tr data-id="${s.id}" class="${state.activeSegmentId === s.id ? 'active' : ''} ${checked ? 'selected' : ''}">
+      <td class="seg-check-col"><input type="checkbox" class="seg-check" ${checked ? 'checked' : ''} title="选择用于整体平移" /></td>
       <td>${s.id}</td>
       <td class="mono">${fmtTime(s.start_ms)}<br>→ ${fmtTime(s.end_ms)}</td>
       <td class="seg-text-cell">${esc(s.text) || '<span class="meta">(空)</span>'}
@@ -419,9 +426,31 @@ function renderSegmentTable() {
     </tr>`;
   }).join('');
 
+  // 片段增删后清理勾选，并同步全选框
+  state.selectedIds = new Set(state.segments.filter((s) => state.selectedIds.has(s.id)).map((s) => s.id));
+  const selectAll = $('segSelectAll');
+  if (selectAll) {
+    selectAll.checked = state.segments.length > 0 && state.selectedIds.size === state.segments.length;
+    selectAll.indeterminate = state.selectedIds.size > 0 && state.selectedIds.size < state.segments.length;
+    selectAll.addEventListener('click', () => {
+      state.selectedIds = selectAll.checked ? new Set(state.segments.map((s) => s.id)) : new Set();
+      renderSegmentTable();
+    });
+  }
+
   tbody.querySelectorAll('tr').forEach((tr) => {
     const id = Number(tr.dataset.id);
     const seg = state.segments.find((s) => s.id === id);
+    const check = tr.querySelector('.seg-check');
+    if (check) check.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (check.checked) state.selectedIds.add(id); else state.selectedIds.delete(id);
+      tr.classList.toggle('selected', check.checked);
+      if (selectAll) {
+        selectAll.checked = state.selectedIds.size === state.segments.length;
+        selectAll.indeterminate = state.selectedIds.size > 0 && state.selectedIds.size < state.segments.length;
+      }
+    });
     tr.querySelector('[data-act=seek]').addEventListener('click', () => {
       state.activeSegmentId = id;
       currentVideoEl().currentTime = seg.start_ms / 1000;
@@ -1110,6 +1139,147 @@ async function confirmRestore() {
   }
 }
 
+/* ================= 片段整体平移 ================= */
+const shiftState = { preview: null, busy: false };
+
+function openShiftModal() {
+  shiftState.preview = null;
+  shiftState.busy = false;
+  $('shiftOffset').value = '';
+  $('shiftError').textContent = '';
+  $('shiftResult').classList.add('hidden');
+  $('shiftConfirmBtn').disabled = true;
+  $('shiftCount').textContent = state.selectedIds.size;
+  $('shiftModal').classList.remove('hidden');
+}
+function closeShiftModal() {
+  $('shiftModal').classList.add('hidden');
+}
+// 偏移被改动后，旧预览令牌不再匹配，必须重新预览
+function invalidateShiftPreview() {
+  shiftState.preview = null;
+  $('shiftResult').classList.add('hidden');
+  $('shiftConfirmBtn').disabled = true;
+}
+
+function shiftParams() {
+  return { segment_ids: [...state.selectedIds], offset_ms: Number($('shiftOffset').value) };
+}
+
+async function previewShift() {
+  $('shiftError').textContent = '';
+  invalidateShiftPreview();
+  if (state.selectedIds.size === 0) {
+    $('shiftError').textContent = '请先在片段列表中勾选要整体平移的片段。';
+    return;
+  }
+  const offRaw = $('shiftOffset').value.trim();
+  if (!/^[+-]?\d+$/.test(offRaw) || Number(offRaw) === 0) {
+    $('shiftError').textContent = '请输入非零整数毫秒偏移（如 500 或 -1000）。';
+    return;
+  }
+  try {
+    const data = await api(`/api/videos/${state.video.id}/segments/shift/preview`, {
+      method: 'POST',
+      body: { segment_ids: [...state.selectedIds], offset_ms: Number(offRaw) },
+    });
+    shiftState.preview = data;
+    renderShiftPreview(data);
+  } catch (err) {
+    $('shiftError').textContent = `预览失败，未写入任何内容：${err.message}`;
+  }
+}
+
+function renderShiftPreview(data) {
+  $('shiftResult').classList.remove('hidden');
+  const conflictBox = $('shiftConflictBox');
+  if (data.conflicts.length) {
+    conflictBox.classList.remove('hidden');
+    $('shiftConflictList').innerHTML = data.conflicts.slice(0, 20)
+      .map((c) => `<li>${esc(c.message)}</li>`).join('') +
+      (data.conflicts.length > 20 ? `<li>… 其余 ${data.conflicts.length - 20} 条从略</li>` : '');
+  } else {
+    conflictBox.classList.add('hidden');
+  }
+  const moveCount = data.moves.length;
+  $('shiftSummary').innerHTML = data.blocked
+    ? `<span class="warn">偏移 <b>${data.offset_ms}</b>ms 时存在 <b>${data.conflicts.length}</b> 处越界/重叠冲突，无法确认；请调整偏移或选择后重新预览。</span>`
+    : `<span style="color:var(--ok)">偏移 <b>${data.offset_ms}</b>ms：${moveCount} 个所选片段可整体平移，相互间距不变（端点相接允许）。` +
+      `确认后逐段递增修订号并撤销原文审校；译文保留文字但标记已失效，须按新时间重新校对。</span>`;
+
+  const byId = new Map(data.moves.map((m) => [m.id, m]));
+  $('shiftTbody').innerHTML = [...state.segments]
+    .filter((s) => byId.has(s.id))
+    .sort((a, b) => a.start_ms - b.start_ms)
+    .map((s) => {
+      const m = byId.get(s.id);
+      const segConflicts = data.conflicts.filter((c) => c.segment_id === s.id);
+      return `
+      <tr class="${segConflicts.length ? 'import-conflict' : ''}">
+        <td>${s.id}</td>
+        <td class="mono">${fmtTime(m.start_ms)}<br>→ ${fmtTime(m.end_ms)}</td>
+        <td class="mono">${fmtTime(m.new_start_ms)}<br>→ ${fmtTime(m.new_end_ms)}</td>
+        <td class="seg-text-cell">${esc(s.text) || '<span class="meta">(空)</span>'}</td>
+        <td>${segConflicts.length ? `<span class="tag bad">${segConflicts.length} 处</span><div class="mono">${esc(segConflicts.map((c) => c.message).join('；'))}</div>` : '<span class="tag ok">无冲突</span>'}</td>
+      </tr>`;
+    }).join('');
+
+  $('shiftConfirmBtn').disabled = data.blocked;
+}
+
+async function confirmShift() {
+  if (shiftState.busy || !shiftState.preview) return;
+  const p = shiftState.preview;
+  if (!confirm(`确定把所选 ${p.selected_count} 个片段整体平移 ${p.offset_ms}ms？\n` +
+    `原文审校将被撤销（修订号逐段 +1）；译文保留文字但标记失效，须重新校对；历史发布版本不受影响。`)) {
+    return;
+  }
+  shiftState.busy = true;
+  $('shiftConfirmBtn').disabled = true;
+  try {
+    const data = await api(`/api/videos/${state.video.id}/segments/shift/confirm`, {
+      method: 'POST',
+      body: { segment_ids: p.moves.map((m) => m.id), offset_ms: p.offset_ms, token: p.token },
+    });
+    const movedIds = data.moved.map((m) => m.id);
+    closeShiftModal();
+    await refreshCurrent(); // 重新加载片段与译文（译文 stale 标记由新时间计算）
+    state.selectedIds = new Set(movedIds);
+    renderSegmentTable();
+    toast(`已整体平移 ${data.moved_count} 个片段；原文已撤销审校、译文已标记失效，请重新校对`);
+  } catch (err) {
+    if (err.status === 409 && err.data && Array.isArray(err.data.current_segments)) {
+      // 预览后草稿被修改（增删改/审校变化）：拒绝覆盖，按最新草稿与相同选择、偏移自动重新预览
+      const changedMsg = `⚠️ ${err.message}`;
+      state.segments = err.data.current_segments;
+      state.selectedIds = new Set((shiftState.preview ? shiftState.preview.moves.map((m) => m.id) : [])
+        .filter((id) => state.segments.some((s) => s.id === id)));
+      $('shiftCount').textContent = state.selectedIds.size;
+      renderSegmentDependent();
+      try {
+        const off = shiftState.preview ? shiftState.preview.offset_ms : 0;
+        const re = await api(`/api/videos/${state.video.id}/segments/shift/preview`, {
+          method: 'POST',
+          body: { segment_ids: [...state.selectedIds], offset_ms: off },
+        });
+        shiftState.preview = re;
+        renderShiftPreview(re);
+      } catch (e2) {
+        invalidateShiftPreview();
+        $('shiftError').textContent = `草稿已变化，按相同条件重新预览失败：${e2.message}`;
+        return;
+      }
+      $('shiftError').textContent = `${changedMsg}\n已按最新草稿重新预览，请核对后再次确认。`;
+      toast('预览后草稿发生了变化，请重新核对预览', true);
+      return;
+    }
+    $('shiftError').textContent = `确认失败，未写入任何内容：${err.message}`;
+    if (shiftState.preview) $('shiftConfirmBtn').disabled = shiftState.preview.blocked;
+  } finally {
+    shiftState.busy = false;
+  }
+}
+
 /* ================= 弹窗事件绑定 ================= */
 document.addEventListener('click', (e) => {
   const menu = $('downloadMenu');
@@ -1142,6 +1312,11 @@ $('restoreModal').addEventListener('click', (e) => { if (e.target === $('restore
 $('trCancel').addEventListener('click', closeTrEditor);
 $('trSave').addEventListener('click', saveTrEditor);
 $('trModal').addEventListener('click', (e) => { if (e.target === $('trModal')) closeTrEditor(); });
+$('shiftCancel').addEventListener('click', closeShiftModal);
+$('shiftPreviewBtn').addEventListener('click', previewShift);
+$('shiftConfirmBtn').addEventListener('click', confirmShift);
+$('shiftOffset').addEventListener('input', invalidateShiftPreview);
+$('shiftModal').addEventListener('click', (e) => { if (e.target === $('shiftModal')) closeShiftModal(); });
 
 /* ================= 启动 ================= */
 loadList().catch((e) => {
