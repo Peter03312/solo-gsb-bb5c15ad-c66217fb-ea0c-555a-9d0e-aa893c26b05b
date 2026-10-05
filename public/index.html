@@ -150,6 +150,43 @@
     </div>
   </div>
 
+  <!-- 多片段整体平移弹窗 -->
+  <div id="shiftModal" class="modal hidden">
+    <div class="modal-card wide">
+      <h3>整体平移所选片段（校准字幕时间）</h3>
+      <p class="meta">已勾选 <b id="shiftSelCount">0</b> 个片段，它们将统一加上同一个毫秒偏移，<b>相对间距保持不变</b>（端点相接允许）。
+        确认后：所选原文片段逐段修订号 +1 并<b>撤销原文审校</b>；其译文保留文字但标记为<b>已失效</b>，须按新时间重新校对；
+        未选片段不动。任一所选片段越过视频边界或与未选片段重叠都会拒绝且不写入；历史发布版本及其 SRT 不受影响。</p>
+      <div class="form-row">
+        <label>偏移 (ms，非零整数；正数延后，负数提前)
+          <input id="shiftOffset" type="number" step="1" placeholder="例如 -250 或 500" />
+        </label>
+        <button type="button" class="btn primary" id="shiftPreviewBtn">预览平移</button>
+      </div>
+      <p id="shiftError" class="error"></p>
+
+      <div id="shiftResult" class="hidden">
+        <p class="meta" id="shiftSummary"></p>
+        <div id="shiftIssueBox" class="conflict-box hidden">
+          <b>⚠️ 平移被阻止（存在越界或重叠）</b>
+          <ul id="shiftIssueList"></ul>
+          <p class="warn">请调整勾选范围或偏移后重新预览；存在问题时无法确认。</p>
+        </div>
+        <div class="import-scroll">
+          <table class="seg-table">
+            <thead><tr><th>#</th><th>调整前时间</th><th>调整后时间</th><th>文本</th><th>状态</th></tr></thead>
+            <tbody id="shiftTbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="shiftCancel">取消</button>
+        <button type="button" class="btn primary" id="shiftConfirmBtn" disabled>确认一次性应用</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 译文编辑弹窗 -->
   <div id="trModal" class="modal hidden">
     <div class="modal-card">

@@ -147,6 +147,9 @@ video { width: 100%; background: #000; border-radius: 8px; max-height: 420px; }
 .seg-table th, .seg-table td { padding: 7px 8px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
 .seg-table th { color: var(--muted); font-weight: normal; position: sticky; top: 0; background: var(--panel); }
 .seg-table tr.active td { background: rgba(79,140,255,.12); }
+.shift-col { width: 34px; text-align: center; }
+.shift-col input { width: auto; }
+tr.shift-selected td { background: rgba(79,140,255,.18); }
 .seg-text-cell { max-width: 220px; white-space: pre-wrap; word-break: break-word; }
 .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--muted); }
 .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 4px; margin-right: 4px; }

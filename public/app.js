@@ -11,6 +11,7 @@ const state = {
   translations: [],      // 当前草稿全部译文（逐段关联）
   activeSegmentId: null,
   editor: null, // { mode:'create'|'edit', segmentId, revision, initialText, dirty }
+  shiftSelected: new Set(), // 整体平移勾选的片段 ID
   pollTimer: null,
 };
 
@@ -198,6 +199,7 @@ async function openVideo(id) {
   state.translationLang = data.translation_lang != null ? data.translation_lang : null;
   state.translations = data.translations || [];
   state.activeSegmentId = null;
+  state.shiftSelected = new Set();
   render();
   startPolling();
 }
@@ -217,6 +219,7 @@ function anyModalOpen() {
          !$('conflictModal').classList.contains('hidden') ||
          !$('importModal').classList.contains('hidden') ||
          !$('restoreModal').classList.contains('hidden') ||
+         !$('shiftModal').classList.contains('hidden') ||
          !$('trModal').classList.contains('hidden');
 }
 async function pollRefresh() {
@@ -232,6 +235,7 @@ async function pollRefresh() {
     state.translations = data.translations || [];
     state.translationLang = data.translation_lang != null ? data.translation_lang : null;
     state.publications = data.publications;
+    syncShiftSelected();
     if (changed) {
       renderSegmentDependent();
       toast('检测到他人的修改，已刷新片段列表');
@@ -246,6 +250,14 @@ function stripTr(t) {
 }
 function trOf(segmentId) {
   return state.translations.find((t) => t.segment_id === segmentId);
+}
+
+// 草稿刷新（轮询/写操作/409 回灌）后，剔除已不存在的勾选片段
+function syncShiftSelected() {
+  const ids = new Set(state.segments.map((s) => s.id));
+  for (const id of [...state.shiftSelected]) {
+    if (!ids.has(id)) state.shiftSelected.delete(id);
+  }
 }
 
 function render() {
@@ -274,6 +286,7 @@ function renderDetail() {
           <div style="display:flex;justify-content:space-between;align-items:center">
             <h2 style="margin:0">片段列表</h2>
             <div class="row-actions">
+              <button class="btn small" id="shiftBtn">⇄ 整体平移…</button>
               <button class="btn small" id="restoreRangeBtn">↩ 区间恢复…</button>
               <button class="btn small" id="importSrtBtn">⬆ 导入 SRT…</button>
               <button class="btn primary small" id="addBtn">＋ 新增片段</button>
@@ -298,6 +311,7 @@ function renderDetail() {
   $('addBtn').addEventListener('click', () => openEditor('create'));
   $('importSrtBtn').addEventListener('click', openImportModal);
   $('restoreRangeBtn').addEventListener('click', openRestoreModal);
+  $('shiftBtn').addEventListener('click', openShiftModal);
   const videoEl = $('videoPlayer');
   videoEl.addEventListener('timeupdate', onTimeUpdate);
 
@@ -388,12 +402,28 @@ function renderSegmentTable() {
   const tbody = $('segTbody');
   if (!tbody) return;
   const track = !!state.translationLang;
-  const colCount = track ? 6 : 5;
+  const colCount = (track ? 6 : 5) + 1;
   if (!state.segments.length) {
     tbody.innerHTML = `<tr><td colspan="${colCount}" class="meta">还没有片段，点击右上角「新增片段」。</td></tr>`;
     return;
   }
+  const allChecked = state.segments.every((s) => state.shiftSelected.has(s.id));
+  const someChecked = !allChecked && state.shiftSelected.size > 0;
+  tbody.parentElement.querySelector('thead tr').innerHTML =
+    `<th class="shift-col"><input type="checkbox" id="shiftSelectAll" ${allChecked ? 'checked' : ''} ` +
+    `${someChecked ? 'data-indeterminate="1"' : ''} title="全选/取消全选（用于整体平移）" /></th>` +
+    `<th>#</th><th>时间</th><th>文本</th>${track ? '<th>译文</th>' : ''}<th>状态</th><th>操作</th>`;
+  const selectAll = $('shiftSelectAll');
+  if (selectAll && someChecked) selectAll.indeterminate = true;
+  if (selectAll) {
+    selectAll.addEventListener('click', () => {
+      if (state.shiftSelected.size === state.segments.length) state.shiftSelected.clear();
+      else state.segments.forEach((s) => state.shiftSelected.add(s.id));
+      renderSegmentTable();
+    });
+  }
   tbody.innerHTML = state.segments.map((s) => {
+    const checked = state.shiftSelected.has(s.id);
     const tr = track ? trOf(s.id) : null;
     const trCell = track ? `
       <td class="seg-text-cell">${tr ? (esc(tr.text) || '<span class="meta">(空)</span>') : '<span class="meta">—</span>'}
@@ -402,7 +432,8 @@ function renderSegmentTable() {
         <button class="btn small" data-act="tr-edit">${tr ? '改译文' : '录译文'}</button>
         ${tr && !tr.stale ? `<button class="btn small ${tr.reviewed ? 'ghost' : 'ok'}" data-act="tr-review">${tr.reviewed ? '取消审译' : '审译'}</button>` : ''}` : '';
     return `
-    <tr data-id="${s.id}" class="${state.activeSegmentId === s.id ? 'active' : ''}">
+    <tr data-id="${s.id}" class="${state.activeSegmentId === s.id ? 'active' : ''} ${checked ? 'shift-selected' : ''}">
+      <td class="shift-col"><input type="checkbox" class="shift-check" data-act="shift-pick" ${checked ? 'checked' : ''} title="勾选后可整体平移" /></td>
       <td>${s.id}</td>
       <td class="mono">${fmtTime(s.start_ms)}<br>→ ${fmtTime(s.end_ms)}</td>
       <td class="seg-text-cell">${esc(s.text) || '<span class="meta">(空)</span>'}
@@ -426,6 +457,13 @@ function renderSegmentTable() {
       state.activeSegmentId = id;
       currentVideoEl().currentTime = seg.start_ms / 1000;
       renderSegmentDependent();
+    });
+    const pick = tr.querySelector('[data-act=shift-pick]');
+    pick.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (pick.checked) state.shiftSelected.add(id);
+      else state.shiftSelected.delete(id);
+      renderSegmentTable();
     });
     tr.querySelector('[data-act=edit]').addEventListener('click', () => openEditor('edit', seg));
     tr.querySelector('[data-act=review]').addEventListener('click', () => toggleReview(seg));
@@ -555,8 +593,12 @@ async function refreshCurrent() {
   state.publications = data.publications;
   state.translations = data.translations || [];
   state.translationLang = data.translation_lang != null ? data.translation_lang : null;
+  syncShiftSelected();
   renderSegmentDependent();
 }
+
+/* ================= 多片段整体平移 ================= */
+const shiftState = { preview: null, busy: false };
 
 /* ================= 译文轨道 ================= */
 async function enableTrack() {
@@ -1110,6 +1152,148 @@ async function confirmRestore() {
   }
 }
 
+/* ================= 多片段整体平移 ================= */
+function openShiftModal() {
+  syncShiftSelected();
+  shiftState.preview = null;
+  shiftState.busy = false;
+  $('shiftOffset').value = '';
+  $('shiftError').textContent = '';
+  $('shiftResult').classList.add('hidden');
+  $('shiftConfirmBtn').disabled = true;
+  renderShiftHeader();
+  $('shiftModal').classList.remove('hidden');
+}
+function closeShiftModal() {
+  $('shiftModal').classList.add('hidden');
+}
+function invalidateShiftPreview() {
+  shiftState.preview = null;
+  $('shiftResult').classList.add('hidden');
+  $('shiftConfirmBtn').disabled = true;
+}
+function renderShiftHeader() {
+  $('shiftSelCount').textContent = state.shiftSelected.size;
+}
+function shiftParams() {
+  return {
+    segment_ids: [...state.shiftSelected].sort((a, b) => a - b),
+    offset_ms: Number($('shiftOffset').value),
+  };
+}
+
+async function previewShift() {
+  $('shiftError').textContent = '';
+  invalidateShiftPreview();
+  renderShiftHeader();
+  if (!state.shiftSelected.size) {
+    $('shiftError').textContent = '请先在片段表中勾选要整体平移的片段（表头复选框可全选）。';
+    return;
+  }
+  try {
+    const data = await api(`/api/videos/${state.video.id}/segments/shift/preview`, {
+      method: 'POST',
+      body: shiftParams(),
+    });
+    shiftState.preview = data;
+    renderShiftPreview(data);
+  } catch (err) {
+    $('shiftError').textContent = `预览失败，未写入任何内容：${err.message}`;
+  }
+}
+
+function renderShiftIssueList(preview) {
+  const box = $('shiftIssueBox');
+  const issues = [
+    ...preview.boundary_issues.map((x) => ({ message: x.message })),
+    ...preview.conflicts.map((x) => ({ message: x.message })),
+  ];
+  if (!issues.length) {
+    box.classList.add('hidden');
+    return;
+  }
+  box.classList.remove('hidden');
+  $('shiftIssueList').innerHTML = issues.slice(0, 30)
+    .map((x) => `<li>${esc(x.message)}</li>`).join('') +
+    (issues.length > 30 ? `<li>… 其余 ${issues.length - 30} 条从略</li>` : '');
+}
+
+function renderShiftPreview(data) {
+  $('shiftResult').classList.remove('hidden');
+  const dir = data.offset_ms > 0 ? `延后 +${data.offset_ms}` : `提前 ${data.offset_ms}`;
+  $('shiftSummary').innerHTML =
+    `将把 <b>${data.selected_count}</b> 个所选片段整体<b>${dir}ms</b>（相对间距不变，未选 ${data.unselected_count} 段不动）。` +
+    (data.blocked
+      ? '<br><span class="warn">存在越界或重叠，确认会被拒绝且不写入；请调整后重新预览。</span>'
+      : '<br><span style="color:var(--ok)">全部落在视频边界内且不与未选片段重叠（端点相接允许），可以确认应用。</span>');
+  renderShiftIssueList(data);
+  const clashIds = new Set(data.conflicts.map((c) => c.segment_id));
+  const boundIds = new Set(data.boundary_issues.map((x) => x.segment_id));
+  $('shiftTbody').innerHTML = data.moved.map((m) => `
+    <tr class="${clashIds.has(m.segment_id) || boundIds.has(m.segment_id) ? 'import-conflict' : ''}">
+      <td>${m.segment_id}</td>
+      <td class="mono">${fmtTime(m.before_start_ms)}<br>→ ${fmtTime(m.before_end_ms)}</td>
+      <td class="mono">${fmtTime(m.after_start_ms)}<br>→ ${fmtTime(m.after_end_ms)}</td>
+      <td class="seg-text-cell">${esc(m.text) || '<span class="meta">(空)</span>'}</td>
+      <td>${m.reviewed ? '<span class="tag ok">已审→待审</span>' : '<span class="tag warn">待审</span>'}
+          <div class="mono">rev ${m.revision} → ${m.revision + 1}</div></td>
+    </tr>`).join('');
+  $('shiftConfirmBtn').disabled = data.blocked;
+}
+
+async function confirmShift() {
+  if (shiftState.busy || !shiftState.preview) return;
+  const p = shiftState.preview;
+  if (!confirm(`确定把勾选的 ${p.moved.length} 个片段整体${p.offset_ms > 0 ? '延后' : '提前'} ${Math.abs(p.offset_ms)}ms？\n` +
+    '所选片段修订号将逐段 +1 并撤销原文审校；其译文保留文字但标记失效，须按新时间重新校对；未选片段不动。')) {
+    return;
+  }
+  shiftState.busy = true;
+  $('shiftConfirmBtn').disabled = true;
+  try {
+    const data = await api(`/api/videos/${state.video.id}/segments/shift/confirm`, {
+      method: 'POST',
+      body: {
+        segment_ids: p.moved.map((m) => m.segment_id).sort((a, b) => a - b),
+        offset_ms: p.offset_ms,
+        token: p.token,
+      },
+    });
+    state.segments = data.segments;
+    state.translations = data.translations || [];
+    syncShiftSelected();
+    closeShiftModal();
+    renderSegmentDependent();
+    toast(`已整体平移 ${data.moved_count} 个片段：原文待重新审校，译文已按新时间标记失效`);
+  } catch (err) {
+    if (err.status === 409 && err.data && Array.isArray(err.data.current_segments)) {
+      // 预览后草稿被修改：拒绝写入，按最新草稿以相同选择与偏移自动重新预览
+      const changedMsg = `⚠️ ${err.message}`;
+      state.segments = err.data.current_segments;
+      renderSegmentDependent();
+      renderShiftHeader();
+      try {
+        const re = await api(`/api/videos/${state.video.id}/segments/shift/preview`, {
+          method: 'POST',
+          body: { segment_ids: [...state.shiftSelected].sort((a, b) => a - b), offset_ms: shiftState.preview ? shiftState.preview.offset_ms : Number($('shiftOffset').value) },
+        });
+        shiftState.preview = re;
+        renderShiftPreview(re);
+        $('shiftError').textContent = `${changedMsg}\n已按最新草稿重新预览，请核对后再次确认。`;
+      } catch (e2) {
+        invalidateShiftPreview();
+        $('shiftError').textContent = `${changedMsg}\n按相同条件重新预览失败：${e2.message}`;
+      }
+      toast('预览后草稿发生了变化，请重新核对预览', true);
+      return;
+    }
+    $('shiftError').textContent = `确认失败，未写入任何内容：${err.message}`;
+    if (shiftState.preview) $('shiftConfirmBtn').disabled = shiftState.preview.blocked;
+  } finally {
+    shiftState.busy = false;
+  }
+}
+
 /* ================= 弹窗事件绑定 ================= */
 document.addEventListener('click', (e) => {
   const menu = $('downloadMenu');
@@ -1142,6 +1326,11 @@ $('restoreModal').addEventListener('click', (e) => { if (e.target === $('restore
 $('trCancel').addEventListener('click', closeTrEditor);
 $('trSave').addEventListener('click', saveTrEditor);
 $('trModal').addEventListener('click', (e) => { if (e.target === $('trModal')) closeTrEditor(); });
+$('shiftCancel').addEventListener('click', closeShiftModal);
+$('shiftPreviewBtn').addEventListener('click', previewShift);
+$('shiftConfirmBtn').addEventListener('click', confirmShift);
+$('shiftOffset').addEventListener('input', invalidateShiftPreview);
+$('shiftModal').addEventListener('click', (e) => { if (e.target === $('shiftModal')) closeShiftModal(); });
 
 /* ================= 启动 ================= */
 loadList().catch((e) => {

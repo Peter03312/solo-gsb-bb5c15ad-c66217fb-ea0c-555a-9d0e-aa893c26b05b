@@ -220,6 +220,7 @@ async function main() {
   await srtImportTests();
   await restoreTests();
   await translationTests();
+  await shiftTests();
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   if (failed) process.exit(1);
@@ -856,6 +857,216 @@ async function translationTests() {
   await req('POST', `/videos/${ev.id}/segments/${e1.id}/review`, { reviewed: true, revision: e1cur.revision });
   r = await req('POST', `/videos/${ev.id}/publish`, {});
   check('停用轨道后按单语门禁发布', r.status === 201 && r.json.publication.has_translation === false, JSON.stringify(r.json));
+}
+
+async function shiftTests() {
+  console.log('21. 多片段整体平移：参数校验与预览');
+  const sv = await uploadVideo('整体平移', 10000, 64);
+  const addSeg = async (start, end, text) =>
+    (await req('POST', `/videos/${sv.id}/segments`, { start_ms: start, end_ms: end, text })).json.segment;
+  const getSegs = async () => (await req('GET', `/videos/${sv.id}`)).json.segments;
+  const shiftPreview = (body) => req('POST', `/videos/${sv.id}/segments/shift/preview`, body);
+  const shiftConfirm = (body) => req('POST', `/videos/${sv.id}/segments/shift/confirm`, body);
+
+  const a = await addSeg(1000, 2000, '甲');
+  const b = await addSeg(3000, 4000, '乙');
+  const c = await addSeg(5000, 6000, '丙');
+
+  // 空选择 / 非数组 / 非正整数 ID
+  let r = await shiftPreview({ segment_ids: [], offset_ms: 100 });
+  check('空选择 -> 422 invalid_segment_ids', r.status === 422 && r.json.error.code === 'invalid_segment_ids');
+  r = await shiftPreview({ segment_ids: 'x', offset_ms: 100 });
+  check('ID 非数组 -> 422', r.status === 422 && r.json.error.code === 'invalid_segment_ids');
+  r = await shiftPreview({ segment_ids: [a.id, -1], offset_ms: 100 });
+  check('ID 非正整数 -> 422', r.status === 422 && r.json.error.code === 'invalid_segment_ids');
+  r = await shiftPreview({ offset_ms: 100 });
+  check('缺少 segment_ids -> 422', r.status === 422 && r.json.error.code === 'invalid_segment_ids');
+  // 重复 ID
+  r = await shiftPreview({ segment_ids: [a.id, a.id, b.id], offset_ms: 100 });
+  check('重复 ID -> 422 duplicate_segment_ids', r.status === 422 && r.json.error.code === 'duplicate_segment_ids' &&
+    r.json.error.duplicate_ids.includes(a.id), JSON.stringify(r.json));
+  // 不存在的 ID
+  r = await shiftPreview({ segment_ids: [a.id, 999999], offset_ms: 100 });
+  check('不存在 ID -> 422 unknown_segments', r.status === 422 && r.json.error.code === 'unknown_segments' &&
+    r.json.error.missing_ids.includes(999999), JSON.stringify(r.json));
+  // 偏移校验
+  r = await shiftPreview({ segment_ids: [a.id] });
+  check('缺少偏移 -> 422 invalid_offset', r.status === 422 && r.json.error.code === 'invalid_offset');
+  r = await shiftPreview({ segment_ids: [a.id], offset_ms: 0 });
+  check('零偏移 -> 422 invalid_offset', r.status === 422 && r.json.error.code === 'invalid_offset');
+  r = await shiftPreview({ segment_ids: [a.id], offset_ms: 1.5 });
+  check('非整数偏移 -> 422', r.status === 422 && r.json.error.code === 'invalid_offset');
+  r = await shiftPreview({ segment_ids: [a.id], offset_ms: '100' });
+  check('字符串偏移 -> 422', r.status === 422 && r.json.error.code === 'invalid_offset');
+  // 未知视频
+  r = await req('POST', '/videos/999999/segments/shift/preview', { segment_ids: [1], offset_ms: 100 });
+  check('未知视频预览 -> 404', r.status === 404);
+
+  console.log('22. 平移预览：前后时间、越界、重叠与相对间距');
+  // 正常预览：甲、乙一起 +500（相对间距 1000ms 不变）
+  let p = await shiftPreview({ segment_ids: [a.id, b.id], offset_ms: 500 });
+  check('正常预览 200', p.status === 200, JSON.stringify(p.json));
+  eq('预览选择/未选数量', [p.json.selected_count, p.json.unselected_count], [2, 1]);
+  eq('预览前后时间', p.json.moved.map((m) => [m.before_start_ms, m.before_end_ms, m.after_start_ms, m.after_end_ms]),
+    [[1000, 2000, 1500, 2500], [3000, 4000, 3500, 4500]]);
+  check('无越界无冲突可确认', p.json.blocked === false && p.json.conflicts.length === 0 && p.json.boundary_issues.length === 0);
+  check('返回确认令牌', typeof p.json.token === 'string' && p.json.token.includes('.'));
+  // 预览不写入
+  let segs = await getSegs();
+  eq('预览不写入', segs.find((x) => x.id === a.id).start_ms, 1000);
+
+  // 越界：起点为 0 边界 / 终点超时长
+  p = await shiftPreview({ segment_ids: [a.id], offset_ms: -2000 });
+  check('起点越过视频边界 -> 预览 blocked', p.status === 200 && p.json.blocked === true &&
+    p.json.boundary_issues.some((x) => x.segment_id === a.id && x.kind === 'before_start'), JSON.stringify(p.json));
+  p = await shiftPreview({ segment_ids: [c.id], offset_ms: 5000 });
+  check('终点越过视频时长 -> 预览 blocked', p.status === 200 &&
+    p.json.boundary_issues.some((x) => x.kind === 'beyond_duration' && x.at === 11000));
+  // 预览中端点相接允许：乙 -1000 -> 2000-3000，与甲 1000-2000 端点相接，且不与丙重叠
+  p = await shiftPreview({ segment_ids: [b.id], offset_ms: -1000 });
+  check('与未选片段端点相接 -> 不冲突', p.json.blocked === false, JSON.stringify(p.json));
+  // 相对间距：多选片段各自平移相同偏移，间距保持
+  p = await shiftPreview({ segment_ids: [a.id, b.id, c.id], offset_ms: 200 });
+  eq('相对间距不变（平移后起点差）',
+    [p.json.moved[1].after_start_ms - p.json.moved[0].after_start_ms,
+     p.json.moved[2].after_start_ms - p.json.moved[1].after_start_ms], [2000, 2000]);
+
+  // 与未选片段重叠：只移甲 +2500 -> 3500-4500 撞上未选乙 3000-4000
+  p = await shiftPreview({ segment_ids: [a.id], offset_ms: 2500 });
+  check('撞上未选片段 -> blocked 且给出双方', p.status === 200 && p.json.blocked === true &&
+    p.json.conflicts.length === 1 && p.json.conflicts[0].segment_id === a.id &&
+    p.json.conflicts[0].other_segment_id === b.id, JSON.stringify(p.json));
+  // 负偏移重叠：移丙 -2500 -> 2500-3500 撞上未选乙
+  p = await shiftPreview({ segment_ids: [c.id], offset_ms: -2500 });
+  check('负偏移撞上未选片段 -> blocked', p.json.blocked === true &&
+    p.json.conflicts[0].other_segment_id === b.id);
+  // 全选整体平移：所选片段之间（含相接）不算冲突；整体 +4000 后丙终点恰好等于视频时长，允许
+  p = await shiftPreview({ segment_ids: [a.id, b.id, c.id], offset_ms: 4000 });
+  check('全选平移无未选冲突、贴视频末尾允许', p.status === 200 && p.json.blocked === false &&
+    p.json.conflicts.length === 0 && p.json.boundary_issues.length === 0, JSON.stringify(p.json));
+  eq('全选平移后丙贴齐视频末尾', p.json.moved[2].after_end_ms, 10000);
+
+  console.log('23. 平移确认：越界/重叠拒绝零写入与事务原子性');
+  p = await shiftPreview({ segment_ids: [a.id], offset_ms: 2500 });
+  r = await shiftConfirm({ segment_ids: [a.id], offset_ms: 2500, token: p.json.token });
+  check('冲突确认 -> 422 shift_blocked 零写入', r.status === 422 && r.json.error.code === 'shift_blocked' &&
+    r.json.error.conflicts.some((x) => x.segment_id === a.id), JSON.stringify(r.json));
+  segs = await getSegs();
+  eq('冲突后时间不变', segs.map((s) => [s.id, s.start_ms, s.end_ms]),
+    [[a.id, 1000, 2000], [b.id, 3000, 4000], [c.id, 5000, 6000]]);
+  p = await shiftPreview({ segment_ids: [c.id], offset_ms: 5000 });
+  r = await shiftConfirm({ segment_ids: [c.id], offset_ms: 5000, token: p.json.token });
+  check('越界确认 -> 422 shift_blocked', r.status === 422 && r.json.error.code === 'shift_blocked' &&
+    r.json.error.boundary_issues.length === 1, JSON.stringify(r.json));
+  eq('越界后零写入', (await getSegs()).find((x) => x.id === c.id).end_ms, 6000);
+
+  console.log('24. 平移确认：令牌、参数一致性与预览后草稿变化');
+  r = await shiftConfirm({ segment_ids: [a.id, b.id], offset_ms: 500 });
+  check('无令牌确认 -> 409 preview_required', r.status === 409 && r.json.error.code === 'preview_required');
+  r = await shiftConfirm({ segment_ids: [a.id, b.id], offset_ms: 500, token: 'garbage.token' });
+  check('坏令牌 -> 409 preview_required', r.status === 409 && r.json.error.code === 'preview_required');
+  p = await shiftPreview({ segment_ids: [a.id, b.id], offset_ms: 500 });
+  r = await shiftConfirm({ segment_ids: [a.id, b.id], offset_ms: 600, token: p.json.token });
+  check('偏移与预览不一致 -> 422 shift_params_changed',
+    r.status === 422 && r.json.error.code === 'shift_params_changed', JSON.stringify(r.json));
+  r = await shiftConfirm({ segment_ids: [a.id], offset_ms: 500, token: p.json.token });
+  check('选择与预览不一致 -> 422 shift_params_changed',
+    r.status === 422 && r.json.error.code === 'shift_params_changed');
+  // 选择顺序不同、集合相同：允许
+  r = await shiftConfirm({ segment_ids: [b.id, a.id], offset_ms: 500, token: p.json.token });
+  check('选择顺序不同但集合相同 -> 201', r.status === 201, JSON.stringify(r.json));
+  eq('两段时间正确移动', r.json.segments.map((s) => [s.start_ms, s.end_ms]),
+    [[1500, 2500], [3500, 4500], [5000, 6000]]);
+  const a2 = r.json.segments.find((x) => x.id === a.id);
+  const b2 = r.json.segments.find((x) => x.id === b.id);
+  const c2 = r.json.segments.find((x) => x.id === c.id);
+  eq('所选片段修订号逐段 +1', [a2.revision, b2.revision], [2, 2]);
+  eq('所选片段撤销审校为待审（原本就待审）', [a2.reviewed, b2.reviewed], [false, false]);
+  eq('未选片段修订号不变', c2.revision, 1);
+
+  // 预览后未选片段发生审校变化 -> 409 draft_changed，不写入
+  p = await shiftPreview({ segment_ids: [a.id], offset_ms: 100 });
+  await req('POST', `/videos/${sv.id}/segments/${c.id}/review`, { reviewed: true, revision: c2.revision });
+  r = await shiftConfirm({ segment_ids: [a.id], offset_ms: 100, token: p.json.token });
+  check('预览后审校变化 -> 409 draft_changed', r.status === 409 && r.json.error.code === 'draft_changed',
+    JSON.stringify(r.json));
+  check('409 附当前片段', Array.isArray(r.json.error.current_segments) && r.json.error.current_segments.length === 3);
+  eq('409 零写入', (await getSegs()).find((x) => x.id === a.id).start_ms, 1500);
+  // 重新预览后确认成功
+  p = await shiftPreview({ segment_ids: [a.id], offset_ms: 100 });
+  r = await shiftConfirm({ segment_ids: [a.id], offset_ms: 100, token: p.json.token });
+  check('重新预览后确认 201', r.status === 201 && r.json.moved_count === 1, JSON.stringify(r.json));
+  eq('甲再次移动 +100', r.json.segments.find((x) => x.id === a.id).start_ms, 1600);
+  eq('甲修订号再次递增', r.json.segments.find((x) => x.id === a.id).revision, 3);
+  eq('乙未受第二次平移影响', [r.json.segments.find((x) => x.id === b.id).start_ms,
+    r.json.segments.find((x) => x.id === b.id).revision], [3500, 2]);
+
+  console.log('25. 平移：撤销原文审校、译文保留但失效、门禁与历史不可变');
+  const xv = await uploadVideo('平移双轨', 10000, 48);
+  await req('PUT', `/videos/${xv.id}/translation/track`, { language: 'en' });
+  const x1 = (await req('POST', `/videos/${xv.id}/segments`, { start_ms: 1000, end_ms: 2000, text: '原文一' })).json.segment;
+  const x2 = (await req('POST', `/videos/${xv.id}/segments`, { start_ms: 4000, end_ms: 5000, text: '原文二' })).json.segment;
+  for (const s of [x1, x2]) {
+    await req('POST', `/videos/${xv.id}/segments/${s.id}/review`, { reviewed: true, revision: 1 });
+    await req('PUT', `/videos/${xv.id}/segments/${s.id}/translation`, { text: s.id === x1.id ? 'One' : 'Two', segment_revision: 2 });
+    await req('POST', `/videos/${xv.id}/segments/${s.id}/translation/review`, { reviewed: true, segment_revision: 2, revision: 1 });
+  }
+  r = await req('POST', `/videos/${xv.id}/publish`, {});
+  check('双轨齐备发布 v1', r.status === 201 && r.json.publication.version === 1, JSON.stringify(r.json));
+
+  // 只平移 x1（与 x2 留有间隙，不冲突）
+  p = await req('POST', `/videos/${xv.id}/segments/shift/preview`, { segment_ids: [x1.id], offset_ms: 500 });
+  check('双轨视频预览 200', p.status === 200);
+  r = await req('POST', `/videos/${xv.id}/segments/shift/confirm`, { segment_ids: [x1.id], offset_ms: 500, token: p.json.token });
+  check('平移确认 201', r.status === 201, JSON.stringify(r.json));
+  eq('已审原文被撤销', r.json.segments.find((s) => s.id === x1.id).reviewed, false);
+  eq('原文修订号 +1', r.json.segments.find((s) => s.id === x1.id).revision, 3);
+  eq('未选原文不动', [r.json.segments.find((s) => s.id === x2.id).start_ms,
+    r.json.segments.find((s) => s.id === x2.id).reviewed], [4000, true]);
+  // 译文：文字保留、标记失效、译文行仍在且其文字与修订号未被改写
+  const tr1After = r.json.translations.find((t) => t.segment_id === x1.id);
+  const tr2After = r.json.translations.find((t) => t.segment_id === x2.id);
+  eq('译文文字保留', tr1After.text, 'One');
+  eq('所选片段译文标记失效', tr1After.stale, true);
+  eq('未选片段译文不失效', tr2After.stale, false);
+  eq('译文行修订号不变', [tr1After.revision, tr2After.revision], [2, 2]);
+
+  // 失效译文不能直接审校
+  r = await req('POST', `/videos/${xv.id}/segments/${x1.id}/translation/review`, { reviewed: true, segment_revision: 3, revision: 2 });
+  check('失效译文审校被拒 -> 422 translation_stale', r.status === 422 && r.json.error.code === 'translation_stale');
+
+  // 发布门禁：原文未审 + 译文失效双重阻止
+  r = await req('POST', `/videos/${xv.id}/publish`, {});
+  check('门禁阻止直接发布', r.status === 422 && r.json.error.code === 'not_publishable');
+  check('pending 指出原文未审与译文失效',
+    r.json.error.pending.some((q) => q.segment_id === x1.id &&
+      q.reasons.includes('segment_unreviewed') && q.reasons.includes('translation_stale')), JSON.stringify(r.json));
+  // 草稿译文 SRT 导出同样被拒
+  const trSrtRes = await fetch(`${BASE}/videos/${xv.id}/srt/translation?version=draft`);
+  const trSrtJson = await trSrtRes.json();
+  check('草稿译文 SRT 失效拒绝导出', trSrtRes.status === 422 && trSrtJson.error.code === 'translation_incomplete' &&
+    trSrtJson.error.pending.some((q) => q.segment_id === x1.id && q.reason === 'translation_stale'), JSON.stringify(trSrtJson));
+
+  // 按新时间重新校对译文 -> 不再失效
+  r = await req('PUT', `/videos/${xv.id}/segments/${x1.id}/translation`, { text: 'One (retimed)', segment_revision: 3, revision: 2 });
+  check('重新校对译文 200', r.status === 200);
+  eq('重新绑定新时间', [r.json.translation.source_start_ms, r.json.translation.source_end_ms], [1500, 2500]);
+  eq('重新校对后不失效', r.json.translation.stale, false);
+  eq('重新校对撤销译文审校', r.json.translation.reviewed, false);
+
+  // 历史发布版本与其原文/译文 SRT 保持不变
+  const pubSrt = await (await fetch(`${BASE}/videos/${xv.id}/srt?version=1`)).text();
+  check('历史原文 SRT 不变', /00:00:01,000 --> 00:00:02,000/.test(pubSrt) && /原文一/.test(pubSrt), pubSrt);
+  const pubTrSrt = await (await fetch(`${BASE}/videos/${xv.id}/srt/translation?version=1`)).text();
+  check('历史译文 SRT 不变', /00:00:01,000 --> 00:00:02,000/.test(pubTrSrt) && /One/.test(pubTrSrt), pubTrSrt);
+  const pubs = (await req('GET', `/videos/${xv.id}/publications`)).json.publications;
+  eq('历史发布版本仍只有 v1', pubs.map((x) => x.version), [1]);
+
+  // 重新齐备后可发布 v2
+  await req('POST', `/videos/${xv.id}/segments/${x1.id}/translation/review`, { reviewed: true, segment_revision: 3, revision: 3 });
+  await req('POST', `/videos/${xv.id}/segments/${x1.id}/review`, { reviewed: true, revision: 3 });
+  r = await req('POST', `/videos/${xv.id}/publish`, {});
+  check('重新校对并审校后发布 v2', r.status === 201 && r.json.publication.version === 2, JSON.stringify(r.json));
 }
 
 const server = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {

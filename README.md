@@ -40,6 +40,12 @@
   - 确认后区间内草稿片段被移除，历史片段作为**待审新片段**写入（修订号从 1 开始）；区间外草稿片段及其修订号、历史发布版本与 SRT 导出语义均不变；
   - 确认的版本与区间须与预览一致；预览后草稿发生任何增删改或审校变化，确认返回 `409` 并要求重新预览；
   - 版本不存在、区间越界或替换后时间线不合法时不写入任何内容；整批恢复在一个事务内原子完成。
+- **多片段整体平移（预览 → 确认，用于校准字幕时间）**：勾选同一视频的多个原文片段，统一加上同一个非零整数毫秒偏移：
+  - 先**预览**每段「调整前 → 调整后」时间，以及与未选片段的时间冲突、是否越过视频边界（端点相接允许、所选片段相对间距不变）；
+  - 再以**相同的片段选择与偏移 + 预览令牌一次性确认**；任一片段越过视频边界或与未选片段重叠都拒绝且不写入，整批应用在一个事务内原子完成；
+  - 成功后**仅移动所选原文片段**：时间加上偏移、修订号逐段 +1、撤销原文审校（文字不变）；未选片段完全不动；
+  - 所选片段的**译文保留文字但标记为「已失效」**，须按新时间重新校对并再审；发布门禁与译文 SRT 导出据此阻止直接发布；历史发布版本及其原文/译文 SRT 导出结果保持不变；
+  - 空选择、重复或不存在的片段 ID、非整数/为零偏移都返回明确的 `422` 错误；预览后草稿发生任何增删改或审校变化，确认返回 `409` 并要求重新预览。
 
 ## 一键启动（Docker Compose，推荐）
 
@@ -80,7 +86,7 @@ npm start
 
 同样访问 http://localhost:8080 。数据默认写入项目下 `./data/`。
 
-运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出等 263 个断言）：
+运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、多片段整体平移的越界/重叠拒绝/译文失效/门禁联动、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出等 332 个断言）：
 
 ```bash
 npm test
@@ -109,22 +115,25 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 1. 打开首页，填写标题并选择视频文件上传（需浏览器可解析的 MP4/WebM 等格式）。
 2. 进入工作台：播放视频或点击时间轴定位，用「＋ 新增片段」并可一键取播放位置为起止时间。
 3. 在片段表中编辑、删除、定位；逐条「标记已审」。绿色=已审，蓝色=待审。
-4. 需要套用现成字幕时，点片段列表右上角「⬆ 导入 SRT…」：选择本地 `.srt` 后「解析并预览」，
+   需要整体校准时间时，勾选若干片段（表头复选框可全选）后点「⇄ 整体平移…」：
+   填写非零整数毫秒偏移（正数延后、负数提前）并「预览平移」，逐段核对调整前后时间、越界与未选片段冲突，
+   确认无误后「确认一次性应用」；所选片段相对间距不变、修订号逐段 +1 并撤销原文审校，其译文会标记「已失效」需重新校对。
+5. 需要套用现成字幕时，点片段列表右上角「⬆ 导入 SRT…」：选择本地 `.srt` 后「解析并预览」，
    核对每条的 SRT 序号、原文件行号、时间与多行文本，以及与当前草稿的冲突；
    无冲突可「追加到草稿」，或随时「替换整个草稿」（已发布版本不受影响）。
    若预览期间草稿被他人改动，确认时会被拒绝并自动按最新草稿重新预览。
-5. 需要把某段字幕回退到历史版本时，点「↩ 区间恢复…」：选择已发布版本并填写整数毫秒区间，
+6. 需要把某段字幕回退到历史版本时，点「↩ 区间恢复…」：选择已发布版本并填写整数毫秒区间，
    「预览恢复」后并列核对区间内发布快照与当前草稿、以及将移除/恢复的清单，再「确认恢复」；
    恢复片段为待审，需重新审校后才能再次发布。
-6. 需要译文时，在右侧「发布与下载」面板输入语言（如 `en`）启用译文轨道：片段表随即出现译文列，
+7. 需要译文时，在右侧「发布与下载」面板输入语言（如 `en`）启用译文轨道：片段表随即出现译文列，
    逐段「录译文/改译文」并按当前原文审校；原文被改动后对应译文显示「已失效」，重新保存译文即完成重新校对。
-7. 右侧「发布与下载」面板实时列出阻塞发布的问题（含译文缺失/待审/已失效）；全部满足后点「发布新版本」，
+8. 右侧「发布与下载」面板实时列出阻塞发布的问题（含译文缺失/待审/已失效）；全部满足后点「发布新版本」，
    启用轨道时发布会同时固定原文与译文两轨快照。
-8. 用「下载 SRT ▾」选择原文或译文的草稿/任一已发布版本导出（译文导出要求该范围译文齐备且未失效）。
+9. 用「下载 SRT ▾」选择原文或译文的草稿/任一已发布版本导出（译文导出要求该范围译文齐备且未失效）。
 
 ## HTTP API 摘要
 
-所有写操作的 JSON 请求体均需携带整数修订号 `revision`（新增片段除外；区间恢复确认改持预览令牌 `token`；
+所有写操作的 JSON 请求体均需携带整数修订号 `revision`（新增片段除外；区间恢复确认、多片段整体平移确认改持预览令牌 `token`；
 译文写操作需同时携带所见原文修订号 `segment_revision`，首次录入译文无需译文 `revision`）。
 
 | 方法 | 路径 | 说明 |
@@ -144,6 +153,8 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 | `POST` | `/api/videos/:id/srt/import` | 确认写入：multipart 或 JSON 携带 `srt`/`content`、`mode=append\|replace`、预览返回的 `token` |
 | `POST` | `/api/videos/:id/restore/preview` | 预览区间恢复 `{version,start_ms,end_ms}`，返回两侧片段清单（`to_restore`/`to_remove`）与确认令牌 `token` |
 | `POST` | `/api/videos/:id/restore/confirm` | 确认区间恢复 `{version,start_ms,end_ms,token}`，事务内整批替换 |
+| `POST` | `/api/videos/:id/segments/shift/preview` | 预览多片段整体平移 `{segment_ids,offset_ms}`，返回逐段调整前后时间、`boundary_issues`/`conflicts`、`blocked` 与确认令牌 `token` |
+| `POST` | `/api/videos/:id/segments/shift/confirm` | 确认整体平移 `{segment_ids,offset_ms,token}`，事务内一次性应用；仅移动所选片段并逐段修订号 +1、撤销原文审校 |
 | `GET` | `/api/videos/:id/srt?version=` | 导出原文 SRT：`draft`（默认）/ `published` / `1` 等版本号 |
 | `PUT` | `/api/videos/:id/translation/track` | 启用译文轨道 `{language}`（同一视频仅一个语言；同语言重复调用幂等） |
 | `DELETE` | `/api/videos/:id/translation/track` | 停用译文轨道并删除草稿全部译文（已发布快照不受影响） |
@@ -287,6 +298,67 @@ curl -s -X POST http://localhost:8080/api/videos/12/restore/confirm \
 | `422 invalid_timeline` | 替换后时间线不合法，未写入 |
 | `422 restore_params_changed` | 确认的版本或区间与预览不一致，需按预览参数确认或重新预览 |
 | `409 preview_required` | 缺失/伪造/过期（服务重启）的恢复预览令牌，需先预览 |
+| `409 draft_changed` | 预览后草稿被修改（增删改或审校变化）；响应附 `current_segments`，必须重新预览后再确认 |
+
+### 多片段整体平移调用示例（两步：预览 → 确认）
+
+把所选片段整体加上同一个非零整数毫秒偏移，用于整体校准字幕时间。片段选择（`segment_ids`，正整数数组，顺序无关）
+与偏移随确认请求原样提交，服务端用 HMAC 令牌把「选择集合 + 偏移 + 草稿指纹」绑定到确认请求；令牌随服务进程重启失效。
+
+第一步——预览（不写入），逐段返回调整前后时间，并指出越界（`boundary_issues`）与未选片段冲突（`conflicts`）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/videos/12/segments/shift/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"segment_ids":[7,9],"offset_ms":500}'
+```
+
+成功返回（节选；即使 `blocked=true` 也返回 200，供工作台展示问题；此时确认会被拒）：
+
+```json
+{
+  "offset_ms": 500,
+  "duration_ms": 60000,
+  "selected_count": 2,
+  "unselected_count": 3,
+  "moved": [
+    { "segment_id": 7, "text": "第一句", "reviewed": true, "revision": 3,
+      "before_start_ms": 1000, "before_end_ms": 2000, "after_start_ms": 1500, "after_end_ms": 2500 },
+    { "segment_id": 9, "text": "第三句", "reviewed": false, "revision": 1,
+      "before_start_ms": 5000, "before_end_ms": 6000, "after_start_ms": 5500, "after_end_ms": 6500 }
+  ],
+  "boundary_issues": [],
+  "conflicts": [
+    { "segment_id": 9, "other_segment_id": 8,
+      "after_start_ms": 5500, "after_end_ms": 6500, "other_start_ms": 6200, "other_end_ms": 7000,
+      "message": "所选片段 #9 平移后（5500–6500ms）与未选片段 #8（6200–7000ms）时间重叠（端点相接允许）" }
+  ],
+  "blocked": true,
+  "token": "eyJ2IjoxMiwibSI6InNoaWZ0Iiwi…….签名"
+}
+```
+
+第二步——确认（与预览相同的选择集合与偏移 + 预览 `token`，顺序可不同）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/videos/12/segments/shift/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"segment_ids":[9,7],"offset_ms":500,"token":"eyJ2IjoxMiwibSI6InNoaWZ0Iiwi…….签名"}'
+```
+
+返回 `201 { ok, offset_ms, moved_count, moved, segments, translations }`：仅所选原文片段被移动，
+修订号逐段 +1、审校被撤销；其译文保留文字但在 `translations[].stale` 中标记为 `true`，须按新时间重新校对。
+失败约定：
+
+| 状态 / code | 含义 |
+| --- | --- |
+| `422 invalid_segment_ids` | `segment_ids` 缺失、为空或不是正整数数组，未写入 |
+| `422 duplicate_segment_ids` | 片段 ID 重复（`error.duplicate_ids` 指出），未写入 |
+| `422 unknown_segments` | 部分 ID 不属于该视频（`error.missing_ids` 指出），未写入 |
+| `422 invalid_offset` | 偏移缺失、非整数或为 0，未写入 |
+| `422 shift_blocked` | 存在越界或未选片段重叠（`error.boundary_issues`/`error.conflicts` 逐条指出），事务未写入 |
+| `422 shift_params_changed` | 确认的选择集合或偏移与预览不一致，需重新预览 |
+| `409 preview_required` | 缺失/伪造/过期（服务重启）的平移预览令牌，需先预览 |
 | `409 draft_changed` | 预览后草稿被修改（增删改或审校变化）；响应附 `current_segments`，必须重新预览后再确认 |
 
 ### 译文轨道调用示例
